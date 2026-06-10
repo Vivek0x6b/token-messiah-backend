@@ -1,7 +1,9 @@
+from __future__ import annotations
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from converter import extract_markdown, get_stats
+from typing import List
 import io
 import os
 import zipfile
@@ -50,7 +52,7 @@ async def convert(file: UploadFile = File(...)):
 # ─── Batch convert → zip ──────────────────────────────────────────────────────
 
 @app.post("/batch")
-async def batch(files: list[UploadFile] = File(...)):
+async def batch(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "No files provided.")
     if len(files) > 10:
@@ -146,10 +148,26 @@ async def polish(request: Request):
                     ]
                 }
             )
-        data    = res.json()
+        print(f"Groq status: {res.status_code}")
+        print(f"Groq response: {res.text[:500]}")
+
+        data = res.json()
+
+        # Groq returned an API error (wrong key, rate limit, etc.)
+        if "error" in data:
+            err_msg = data["error"].get("message", "Unknown Groq error")
+            raise HTTPException(502, f"Groq API error: {err_msg}")
+
+        # Unexpected response shape
+        if "choices" not in data or not data["choices"]:
+            raise HTTPException(502, f"Unexpected Groq response: {str(data)[:200]}")
+
         cleaned = data["choices"][0]["message"]["content"].strip()
         return JSONResponse({"markdown": cleaned})
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(504, "AI polish timed out. Try again.")
     except Exception as e:
+        print(f"Polish exception: {str(e)}")
         raise HTTPException(500, f"AI polish failed: {str(e)}")
