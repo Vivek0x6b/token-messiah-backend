@@ -8,7 +8,7 @@ app = FastAPI(title="PDF to Markdown API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://token-messiah-frontend.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
