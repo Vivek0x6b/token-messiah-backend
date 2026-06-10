@@ -144,6 +144,27 @@ def extract_text_from_page(page) -> str:
 
 # ─── Table Extraction (pdfplumber) ────────────────────────────────────────────
 
+def is_real_table(rows: list) -> bool:
+    """Reject layout columns/design elements misdetected as tables."""
+    if len(rows) < 2:
+        return False
+    col_count = max(len(row) for row in rows)
+    if col_count < 2:
+        return False
+    all_cells = [cell for row in rows for cell in row if cell.strip()]
+    if not all_cells:
+        return False
+    avg_cell_len = sum(len(c) for c in all_cells) / len(all_cells)
+    if avg_cell_len > 120:
+        return False
+    multi_col_rows = sum(
+        1 for row in rows if sum(1 for c in row if c.strip()) >= 2
+    )
+    if multi_col_rows < 2:
+        return False
+    return True
+
+
 def table_to_markdown(table: list) -> str:
     if not table or not table[0]:
         return ""
@@ -154,6 +175,8 @@ def table_to_markdown(table: list) -> str:
     ]
     rows = [row for row in rows if any(c.strip() for c in row)]
     if not rows:
+        return ""
+    if not is_real_table(rows):
         return ""
     col_count = max(len(row) for row in rows)
     rows = [row + [""] * (col_count - len(row)) for row in rows]
