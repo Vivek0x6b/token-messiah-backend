@@ -1,22 +1,19 @@
 from __future__ import annotations
 import re
-import fitz  # pymupdf - for text extraction (better layout, spacing, columns)
-import pdfplumber  # kept only for table extraction (better precision)
+import io
+import fitz        # pymupdf — text extraction
+import pdfplumber  # table extraction only
 
 
-# ─── Text Cleaning ────────────────────────────────────────────────────────────
+# ─── Spacing & Cleaning ───────────────────────────────────────────────────────
 
 def fix_spacing(text: str) -> str:
     if not text:
         return ""
-    # Fix missing space between lowercase→uppercase (merged words)
     text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    # Fix missing space after punctuation
     text = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', text)
-    # Fix digit↔letter merges
     text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
     text = re.sub(r'([A-Za-z])(\d)', r'\1 \2', text)
-    # Collapse multiple spaces
     text = re.sub(r'[ \t]{2,}', ' ', text)
     return text
 
@@ -24,40 +21,125 @@ def fix_spacing(text: str) -> str:
 def clean_text(text: str) -> str:
     if not text:
         return ""
-    lines = text.splitlines()
-    cleaned = []
-    for line in lines:
+    lines = []
+    for line in text.splitlines():
         line = line.rstrip()
-        # Skip standalone page numbers
-        if re.match(r'^\s*\d+\s*$', line):
+        if re.match(r'^\s*\d+\s*$', line):           # page numbers
             continue
-        # Skip TOC leader lines
-        if re.match(r'^\s*[.\-_]{4,}\s*$', line):
+        if re.match(r'^\s*[.\-_]{4,}\s*$', line):    # TOC leaders
             continue
-        # Remove (cid:NNN) PDF artifacts
-        line = re.sub(r'\(cid:\d+\)', '', line)
-        # Remove lines that are only whitespace after cleanup
-        cleaned.append(line if line.strip() else "")
+        line = re.sub(r'\(cid:\d+\)', '', line)       # PDF artifacts
+        # Remove common journal footer/header lines
+        if re.search(r'VOLUME\s*\d+|IEEE\s+ACCESS|creativecommons\.org', line, re.I):
+            continue
+        lines.append(line if line.strip() else "")
 
-    text = "\n".join(cleaned)
+    text = "\n".join(lines)
     text = fix_spacing(text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 def detect_heading(line: str) -> str:
-    """Conservative heading detection — avoids false positives in references."""
     s = line.strip()
     if not s or len(s) > 120:
         return line
-    # Numbered section: "1 Introduction", "2.1 Overview"
+
+    # Numbered section: "I. INTRODUCTION" or "2.1 Overview"
+    if re.match(r'^[IVX]+\.\s+[A-Z]', s) and len(s) < 80:      # Roman numeral
+        return f"## {s}"
     if re.match(r'^(\d+\.)*\d+\s+[A-Z][a-z]', s) and len(s) < 80:
         depth = s.count('.')
         return f"{'###' if depth >= 1 else '##'} {s}"
-    # ALL CAPS heading (strict: only letters and spaces)
-    if re.match(r'^[A-Z][A-Z\s]{3,59}$', s):
+
+    # ALL CAPS heading — strict: short, no digits, looks like a real title
+    # Exclude author names (contain dots or are very long)
+    if (re.match(r'^[A-Z][A-Z\s,.\-]+$', s)
+            and 4 < len(s) < 60
+            and not re.search(r'\d', s)
+            and s.count('.') <= 1):
         return f"# {s}"
+
     return line
+
+
+# ─── Column Detection ─────────────────────────────────────────────────────────
+
+def is_two_column(page) -> tuple[bool, float]:
+    """
+    Detect if a page has two columns by analyzing the horizontal
+    distribution of text blocks. Returns (is_two_col, split_x).
+    """
+    blocks = page.get_text("blocks")
+    if not blocks:
+        return False, 0
+
+    page_width = page.rect.width
+    mid = page_width / 2
+
+    # Count blocks clearly in left vs right half
+    left_blocks = [b for b in blocks if b[6] == 0 and b[2] < mid * 0.9]
+    right_blocks = [b for b in blocks if b[6] == 0 and b[0] > mid * 1.1]
+
+    total = len([b for b in blocks if b[6] == 0])
+    if total == 0:
+        return False, mid
+
+    # If significant blocks exist on both sides → two column
+    is_two_col = len(left_blocks) >= 2 and len(right_blocks) >= 2
+    return is_two_col, mid
+
+
+def extract_column_text(page, x0: float, x1: float) -> str:
+    """Extract text from a vertical strip of the page (one column)."""
+    clip = fitz.Rect(x0, 0, x1, page.rect.height)
+    blocks = page.get_text("blocks", clip=clip, sort=True)
+    lines = []
+    prev_y = None
+    for block in blocks:
+        if block[6] != 0:
+            continue
+        text = block[4].strip()
+        if not text:
+            continue
+        y0 = block[1]
+        if prev_y is not None and (y0 - prev_y) > 20:
+            lines.append("")
+        lines.append(text)
+        prev_y = block[3]
+    return "\n".join(lines)
+
+
+def extract_text_from_page(page) -> str:
+    """
+    Smart extraction: detect column layout and extract accordingly.
+    Single column → full page extract.
+    Two column → extract left then right, concatenate.
+    """
+    is_two_col, mid = is_two_column(page)
+
+    if is_two_col:
+        # Add small margin to avoid overlap
+        left = extract_column_text(page, 0, mid - 5)
+        right = extract_column_text(page, mid + 5, page.rect.width)
+        return left + ("\n\n" if left and right else "") + right
+    else:
+        # Single column — standard block extraction
+        blocks = page.get_text("blocks", sort=True)
+        lines = []
+        prev_y = None
+        for block in blocks:
+            if block[6] != 0:
+                continue
+            text = block[4].strip()
+            if not text:
+                continue
+            y0 = block[1]
+            if prev_y is not None and (y0 - prev_y) > 20:
+                lines.append("")
+            lines.append(text)
+            prev_y = block[3]
+        return "\n".join(lines)
 
 
 # ─── Table Extraction (pdfplumber) ────────────────────────────────────────────
@@ -82,10 +164,9 @@ def table_to_markdown(table: list) -> str:
     return "\n".join(lines)
 
 
-def extract_tables_from_page(pdf_path_or_obj, page_index: int) -> list[str]:
-    """Use pdfplumber just for table extraction on a specific page."""
+def extract_tables(file_bytes: bytes, page_index: int) -> list[str]:
     try:
-        with pdfplumber.open(pdf_path_or_obj) as pdf:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             if page_index >= len(pdf.pages):
                 return []
             tables = pdf.pages[page_index].extract_tables()
@@ -94,63 +175,28 @@ def extract_tables_from_page(pdf_path_or_obj, page_index: int) -> list[str]:
         return []
 
 
-# ─── Text Extraction (pymupdf) ────────────────────────────────────────────────
-
-def extract_text_from_page(page) -> str:
-    """
-    Extract text using pymupdf with layout preservation.
-    'blocks' mode respects reading order and column boundaries.
-    """
-    blocks = page.get_text("blocks", sort=True)  # sort=True = reading order
-    lines = []
-    prev_y = None
-
-    for block in blocks:
-        # block = (x0, y0, x1, y1, text, block_no, block_type)
-        if block[6] != 0:  # skip image blocks
-            continue
-        text = block[4].strip()
-        if not text:
-            continue
-
-        # Add blank line between blocks that are far apart vertically
-        y0 = block[1]
-        if prev_y is not None and (y0 - prev_y) > 20:
-            lines.append("")
-
-        lines.append(text)
-        prev_y = block[3]  # y1 (bottom of block)
-
-    return "\n".join(lines)
-
-
-# ─── Main Extraction ──────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def extract_markdown(file_obj) -> tuple[str, int]:
-    import io
-
-    # Read bytes once — share between pymupdf and pdfplumber
     file_bytes = file_obj.read()
-    page_count = 0
     parts = []
 
-    # Open with pymupdf for text
     fitz_doc = fitz.open(stream=file_bytes, filetype="pdf")
     page_count = len(fitz_doc)
 
     for i, page in enumerate(fitz_doc):
         page_parts = []
 
-        # 1. Tables via pdfplumber
-        table_mds = extract_tables_from_page(io.BytesIO(file_bytes), i)
-        page_parts.extend([t for t in table_mds if t])
+        # Tables via pdfplumber
+        for t in extract_tables(file_bytes, i):
+            if t:
+                page_parts.append(t)
 
-        # 2. Text via pymupdf
-        raw_text = extract_text_from_page(page)
-        if raw_text:
-            lines = raw_text.splitlines()
-            processed = [detect_heading(line) for line in lines]
-            cleaned = clean_text("\n".join(processed))
+        # Text via pymupdf with column detection
+        raw = extract_text_from_page(page)
+        if raw:
+            lines = [detect_heading(l) for l in raw.splitlines()]
+            cleaned = clean_text("\n".join(lines))
             if cleaned:
                 page_parts.append(cleaned)
 
@@ -162,7 +208,6 @@ def extract_markdown(file_obj) -> tuple[str, int]:
 
     markdown = "\n\n---\n\n".join(parts)
     markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip()
-
     return markdown, page_count
 
 
